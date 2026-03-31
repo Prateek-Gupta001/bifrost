@@ -191,7 +191,6 @@ func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 	} else {
 		s.markPluginDisabled(semanticcache.PluginName)
 	}
-
 	// 6. Litellmcompat (if configured in PluginConfigs)
 	litellmcompatConfig := s.getPluginConfig(litellmcompat.PluginName)
 	if litellmcompatConfig != nil && litellmcompatConfig.Enabled {

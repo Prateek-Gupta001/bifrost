@@ -36,11 +36,12 @@ type Config struct {
 	Dimension            int           `json:"dimension"`                        // Dimension for vector store
 
 	// Advanced caching behavior
-	DefaultCacheKey              string `json:"default_cache_key,omitempty"`              // Default cache key used when no per-request key is provided (optional, caching is disabled when empty and no per-request key is set)
-	ConversationHistoryThreshold int    `json:"conversation_history_threshold,omitempty"` // Skip caching for requests with more than this number of messages in the conversation history (default: 3)
-	CacheByModel                 *bool  `json:"cache_by_model,omitempty"`                // Include model in cache key (default: true)
-	CacheByProvider              *bool  `json:"cache_by_provider,omitempty"`             // Include provider in cache key (default: true)
-	ExcludeSystemPrompt          *bool  `json:"exclude_system_prompt,omitempty"`         // Exclude system prompt in cache key (default: false)
+	DefaultCacheKey              string        `json:"default_cache_key,omitempty"`              // Default cache key used when no per-request key is provided (optional, caching is disabled when empty and no per-request key is set)
+	ConversationHistoryThreshold int           `json:"conversation_history_threshold,omitempty"` // Skip caching for requests with more than this number of messages in the conversation history (default: 3)
+	CacheByModel                 *bool         `json:"cache_by_model,omitempty"`                 // Include model in cache key (default: true)
+	CacheByProvider              *bool         `json:"cache_by_provider,omitempty"`              // Include provider in cache key (default: true)
+	ExcludeSystemPrompt          *bool         `json:"exclude_system_prompt,omitempty"`          // Exclude system prompt in cache key (default: false)
+	EvictionInterval             time.Duration `json:"eviction_interval,omitempty"`              //Duration after which the cache cleanup go routine runs. (defaults to twice the TTL)
 }
 
 // UnmarshalJSON implements custom JSON unmarshaling for semantic cache Config.
@@ -144,6 +145,7 @@ type Plugin struct {
 	client             *bifrost.Bifrost
 	streamAccumulators sync.Map // Track stream accumulators by request ID
 	waitGroup          sync.WaitGroup
+	CacheCleanupCancel context.CancelFunc
 }
 
 // Plugin constants
@@ -303,6 +305,11 @@ func Init(ctx context.Context, config *Config, logger schemas.Logger, store vect
 		logger.Debug(PluginLoggerPrefix + " Conversation history threshold is not set, using default of " + strconv.Itoa(DefaultConversationHistoryThreshold))
 		config.ConversationHistoryThreshold = DefaultConversationHistoryThreshold
 	}
+	if config.EvictionInterval == 0 {
+		logger.Debug(PluginLoggerPrefix + "Eviction Interval is not set, using default of " + (2 * config.TTL).String())
+		config.EvictionInterval = 2 * config.TTL
+
+	}
 
 	// Set cache behavior defaults
 	if config.CacheByModel == nil {
@@ -311,12 +318,13 @@ func Init(ctx context.Context, config *Config, logger schemas.Logger, store vect
 	if config.CacheByProvider == nil {
 		config.CacheByProvider = bifrost.Ptr(true)
 	}
-
+	CacheCleanCtx, CacheCleanCtxCancel := context.WithCancel(context.Background())
 	plugin := &Plugin{
-		store:     store,
-		config:    config,
-		logger:    logger,
-		waitGroup: sync.WaitGroup{},
+		store:              store,
+		config:             config,
+		logger:             logger,
+		waitGroup:          sync.WaitGroup{},
+		CacheCleanupCancel: CacheCleanCtxCancel,
 	}
 
 	if config.Provider == "" || len(config.Keys) == 0 {
@@ -346,6 +354,49 @@ func Init(ctx context.Context, config *Config, logger schemas.Logger, store vect
 	if err := store.CreateNamespace(createCtx, config.VectorStoreNamespace, config.Dimension, VectorStoreProperties); err != nil {
 		return nil, fmt.Errorf("failed to create namespace for semantic cache: %w", err)
 	}
+
+	plugin.waitGroup.Add(1)
+	go func() {
+		plugin.logger.Info("%s Starting Background Cache Eviction", PluginLoggerPrefix)
+		//starting cache revision
+		ticker := time.NewTicker(config.EvictionInterval)
+		defer ticker.Stop()
+		defer plugin.waitGroup.Done()
+		for {
+			select {
+			case <-ticker.C:
+				plugin.logger.Info("%s Starting Background Cache Eviction", PluginLoggerPrefix)
+				queries := []vectorstore.Query{
+					{
+						Field:    "expires_at",
+						Operator: vectorstore.QueryOperatorLessThan,
+						Value:    time.Now().Unix(),
+					},
+					{
+						Field:    "from_bifrost_semantic_cache_plugin",
+						Operator: vectorstore.QueryOperatorEqual,
+						Value:    true,
+					},
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), CacheSetTimeout)
+				results, err := plugin.store.DeleteAll(ctx, plugin.config.VectorStoreNamespace, queries)
+				cancel()
+				if err != nil {
+					plugin.logger.Warn("%s Failed to delete cache entries for id during periodic cleanup: %v", PluginLoggerPrefix, err)
+				}
+
+				for _, result := range results {
+					if result.Status == vectorstore.DeleteStatusError {
+						plugin.logger.Warn("%s Failed to delete cache entry for id %s: %s", PluginLoggerPrefix, result.ID, result.Error)
+					}
+				}
+
+				plugin.logger.Info(fmt.Sprintf("%s Deleted %d no. of entries during periodic cache cleanup", PluginLoggerPrefix, len(results)))
+			case <-CacheCleanCtx.Done():
+				return
+			}
+		}
+	}()
 
 	return plugin, nil
 }
@@ -699,6 +750,7 @@ func (plugin *Plugin) WaitForPendingOperations() {
 // Cleanup performs cleanup operations for the semantic cache plugin.
 // It removes all cached entries created by this plugin from the VectorStore only if CleanUpOnShutdown is true.
 // Identifies cache entries by the presence of semantic cache-specific fields (request_hash, cache_key).
+// It also closes the periodic cache cleanup go routine.
 //
 // The function performs the following operations:
 // 1. Checks if cleanup is enabled via CleanUpOnShutdown config
@@ -711,6 +763,7 @@ func (plugin *Plugin) WaitForPendingOperations() {
 // Returns:
 //   - error: Any error that occurred during cleanup operations
 func (plugin *Plugin) Cleanup() error {
+	plugin.CacheCleanupCancel()
 	plugin.waitGroup.Wait()
 
 	// Clean up old stream accumulators first
